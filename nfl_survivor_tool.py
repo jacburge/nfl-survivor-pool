@@ -78,6 +78,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import requests
 import schedule_2025
+import os
+from dotenv import load_dotenv
 
 # The requests and BeautifulSoup imports are retained for potential future use,
 # but the current implementation no longer scrapes the schedule from FFToday.
@@ -665,14 +667,54 @@ def update_elo_ratings(team_ratings: Dict[str, float], results: List[Dict[str, o
         team_ratings[away] = rating_away - delta
 
 
+def fetch_betting_lines(week: int) -> dict:
+    """
+    Fetch NFL point spreads for the given week using The Odds API.
+    Returns a dict: {week: { (away, home): spread, ... } }
+    """
+    load_dotenv()
+    api_key = os.environ.get("ODDS_API_KEY")
+    if not api_key:
+        print("No API key found for The Odds API.")
+        return {}
+    url = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/"
+    params = {
+        "apiKey": api_key,
+        "regions": "us",
+        "markets": "spreads",
+        "oddsFormat": "american"
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        lines = {}
+        for game in data:
+            home = game['home_team']
+            away = game['away_team']
+            # Find the first bookmaker with a spread
+            for bookmaker in game.get('bookmakers', []):
+                for market in bookmaker.get('markets', []):
+                    if market['key'] == 'spreads':
+                        for outcome in market['outcomes']:
+                            if outcome['name'] == home:
+                                spread = outcome['point']
+                                lines[(away, home)] = spread
+                        break
+                break
+        return {week: lines}
+    except Exception as e:
+        print(f"Could not fetch betting lines: {e}")
+        return {}
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="NFL Survivor Pool optimizer")
     parser.add_argument('--week', type=int, default=1, help='Week number to generate picks for')
     parser.add_argument('--update-elo', action='store_true', help='Update Elo ratings using live results up to this week')
+    parser.add_argument('--use-betting-lines', action='store_true', help='Fetch and apply live betting lines for this week')
     args = parser.parse_args()
-    # Fetch schedule from the embedded manual list.  We avoid scraping because the
-    # FFToday site blocks automated requests from our environment.
     raw_schedule = load_manual_schedule()
     games = [Game(**g) for g in raw_schedule if g['week'] <= 18]
     team_ratings = compute_team_ratings()
@@ -682,25 +724,15 @@ def main():
             if results:
                 update_elo_ratings(team_ratings, results)
     picker = SURVIVOR_PICKER(games, team_ratings=team_ratings)
+    # --- Fetch and apply betting lines if requested ---
+    if args.use_betting_lines:
+        betting_lines = fetch_betting_lines(args.week)
+        if betting_lines:
+            picker.apply_betting_lines(betting_lines)
+    # --------------------------------------------------
     picker.update_situational_factors()
-    # Example usage of live data integration:
-    #
-    # betting_lines = {
-    #     1: {('Dallas Cowboys', 'Philadelphia Eagles'): -3.5},
-    #     2: {('Buffalo Bills', 'New York Jets'): -4.0},
-    #     # ... fill in spreads for each game you have lines for ...
-    # }
-    # injuries = {
-    #     'Kansas City Chiefs': 30.0,  # Quarterback questionable
-    #     'New Orleans Saints': 15.0,
-    # }
-    # picker.apply_injury_reports(injuries)
-    # picker.apply_betting_lines(betting_lines)
-    # picker.update_situational_factors()
-    # Recommend picks for the desired week
     pick1, pick2 = picker.recommend_picks(args.week)
     print(f"Recommended picks for week {args.week}: Entry1 = {pick1}, Entry2 = {pick2}")
-    # Print summary
     summary = picker.summary_for_week(args.week)
     print("\nSummary (team, winProb, popularity, futureValue, EV):")
     for team, prob, pop, fv, ev in summary:
