@@ -1,70 +1,41 @@
 """
 NFL Survivor Pool optimization tool for the 2025 season.
 
-This module scrapes the 2025 NFL schedule, assigns baseline power ratings to
-teams, derives situational factors (rest, travel and time‑zone adjustments)
-and estimates win probabilities using a simple Elo‑style model.  It also
-computes the expected value of potential survivor picks and recommends two
-weekly selections designed to maximize the probability that at least one of
-two entries survives through the entire season.
+This tool helps you optimize your picks for an NFL Survivor Pool. It loads the 2025 NFL schedule,
+assigns baseline power ratings to teams, applies situational factors (rest, travel, time zone, altitude),
+and estimates win probabilities using an Elo-style model. The tool can incorporate live Elo updates,
+betting lines, and injury adjustments. It supports any number of entries and can simulate your season-long
+survival odds.
 
-The tool is deliberately self‑contained: it doesn't rely on third‑party
-prediction APIs or paid datasets.  Instead, it scrapes publicly available
-information (the full schedule) and applies the analytical framework
-described in the accompanying report.  You can update the underlying
-ratings, situational adjustments or EV logic by editing the constants
-defined below.
+Key features:
+- Up-to-date schedule and power ratings (based on 2024 results)
+- Situational adjustments: rest, travel, time zone, altitude
+- Live Elo updates: Optionally update team ratings with real results
+- Live betting lines: Optionally fetch and apply current point spreads
+- Injury adjustments: Optionally apply Elo penalties for injured players (see injuries.py)
+- Pick popularity: Heuristic or real data (if available)
+- Supports multiple entries: Track and simulate any number of entries (see picks.py)
+- Monte Carlo simulation: Estimate probability at least one entry survives the season
 
-To use this module interactively, execute it as a script.  It will fetch
-the schedule on first run and print the recommended picks for a given week.
+To use this module, execute it as a script. It will print recommended picks for each entry for a given week,
+and can simulate your survival odds.
 
-Example usage::
+Example usage:
 
+    # Print recommended picks for week 1
     python3 nfl_survivor_tool.py --week 1
 
-The script will output two recommended teams for week 1 along with
-supporting metrics.  Running it for subsequent weeks will incorporate
-previous picks and updated rest/travel adjustments.
+    # Update Elo ratings with real results up to week 5
+    python3 nfl_survivor_tool.py --week 5 --update-elo
 
-The key functions and classes exported by this module are:
+    # Fetch and apply current betting lines for week 3
+    python3 nfl_survivor_tool.py --week 3 --use-betting-lines
 
-    scrape_schedule()  -> list of dicts
-        Scrapes the 2025 NFL schedule from FFToday and returns a list
-        containing one dictionary per game with week, date, teams and site
-        information.
+    # Simulate survival odds for 3 entries with 50,000 simulations
+    python3 nfl_survivor_tool.py --week 1 --simulate-survival --entries 3 --simulations 50000
 
-    compute_team_ratings()  -> dict
-        Returns a dictionary mapping full team names to baseline Elo‑style
-        power ratings based on the 2024 final standings.  Ratings are
-        anchored at 1500 points and scaled by win/loss differential.
-
-    SURVIVOR_PICKER class
-        Encapsulates the logic required to compute situational factors,
-        estimate win probabilities, calculate expected value and simulate
-        survivor strategies.  Instantiate with the scraped schedule and
-        optional pre‑defined ratings and run the recommend_picks() method
-        each week.
-
-The tool is designed for educational and planning purposes and makes
-numerous simplifications relative to professionally maintained models:
-
-  * Power ratings are derived solely from prior season records (wins minus
-    losses).  In reality, roster turnover, coaching changes and preseason
-    expectations would modify these values, but the simple method still
-    produces reasonable ordinal rankings.
-  * Situational adjustments (rest advantage, travel distance, time zone
-    displacement and altitude) are based on published research summarised in
-    the user's report.  You can adjust the constants REST_POINTS,
-    TRAVEL_POINTS, TZ_POINTS and ALTITUDE_POINTS to tune the model.
-  * Pick popularity is heuristically approximated by ranking games by
-    predicted win probability.  More sophisticated approaches would
-    incorporate crowd‑sourced selection data.
-  * The EV algorithm evaluates picks week by week but does not exhaustively
-    search every possible pick path (which would require solving a large
-    combinatorial optimisation problem).  Instead, it implements a greedy
-    strategy that balances win probability, popularity and future value
-    (using the simple future_value() method) and ensures diversification
-    across two entries.
+Edit picks.py to track your picks for each entry, and injuries.py to specify Elo penalties for injuries.
+The tool will always avoid recommending teams you've already picked.
 
 You are encouraged to inspect and modify the code to suit your needs.
 """
