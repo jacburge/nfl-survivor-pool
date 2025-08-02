@@ -79,6 +79,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import requests
 import schedule_2025
+from injuries import INJURIES
+
 import os
 from dotenv import load_dotenv
 from picks import PICKS
@@ -911,6 +913,8 @@ def main():
             used_teams=used_teams
         )
         print(f"\nEstimated probability at least one entry survives the season: {prob:.2%}")
+    if INJURIES:
+        picker.apply_injury_reports(INJURIES)
 
 if __name__ == '__main__':
     main()
