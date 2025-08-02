@@ -74,12 +74,14 @@ from __future__ import annotations
 import datetime as _dt
 import math
 import re
+import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import requests
 import schedule_2025
 import os
 from dotenv import load_dotenv
+from picks import PICKS
 
 # The requests and BeautifulSoup imports are retained for potential future use,
 # but the current implementation no longer scrapes the schedule from FFToday.
@@ -575,6 +577,156 @@ class SURVIVOR_PICKER:
         summary.sort(key=lambda t: t[4], reverse=True)
         return summary
 
+    def simulate_two_entry_survivor_paths(
+        self,
+        start_week: int,
+        num_simulations: int = 10000,
+        random_seed: Optional[int] = None,
+        used_teams_1: Optional[set] = None,
+        used_teams_2: Optional[set] = None
+    ) -> float:
+        """
+        Simulate multiple survivor paths for two entries using Monte Carlo.
+        Returns the estimated probability that at least one entry survives all weeks.
+        """
+        if random_seed is not None:
+            random.seed(random_seed)
+        survival_count = 0
+        for _ in range(num_simulations):
+            ut1 = set(used_teams_1) if used_teams_1 else set()
+            ut2 = set(used_teams_2) if used_teams_2 else set()
+            alive_1 = True
+            alive_2 = True
+            for week in range(start_week, 19):
+                week_games = [g for g in self.schedule if g.week == week]
+                # Build candidate picks for each entry (teams not yet used)
+                candidates_1 = []
+                candidates_2 = []
+                for g in week_games:
+                    # Pick the favourite for each game
+                    if g.win_prob_home is None or g.win_prob_away is None:
+                        continue
+                    if g.win_prob_home >= g.win_prob_away:
+                        fav_team = g.home
+                        win_prob = g.win_prob_home
+                    else:
+                        fav_team = g.away
+                        win_prob = g.win_prob_away
+                    if fav_team not in ut1:
+                        candidates_1.append((fav_team, win_prob))
+                    if fav_team not in ut2:
+                        candidates_2.append((fav_team, win_prob))
+                if not candidates_1 and not candidates_2:
+                    alive_1 = False
+                    alive_2 = False
+                    break
+                # Weighted random pick for each entry
+                pick_1 = None
+                pick_2 = None
+                if candidates_1:
+                    teams1, probs1 = zip(*candidates_1)
+                    weights1 = [p / sum(probs1) for p in probs1]
+                    pick_1 = random.choices(teams1, weights=weights1, k=1)[0]
+                if candidates_2:
+                    teams2, probs2 = zip(*candidates_2)
+                    weights2 = [p / sum(probs2) for p in probs2]
+                    # Ensure entry 2 does not pick the same team as entry 1 if possible
+                    filtered = [(t, w) for t, w in zip(teams2, weights2) if t != pick_1]
+                    if filtered:
+                        teams2, weights2 = zip(*filtered)
+                        pick_2 = random.choices(teams2, weights=weights2, k=1)[0]
+                    else:
+                        pick_2 = pick_1 if pick_1 else random.choices(teams2, weights=weights2, k=1)[0]
+                # Simulate win/loss for each entry
+                win_chance_1 = dict(candidates_1).get(pick_1, 0) if pick_1 else 0
+                win_chance_2 = dict(candidates_2).get(pick_2, 0) if pick_2 else 0
+                if pick_1:
+                    if random.random() > win_chance_1:
+                        alive_1 = False
+                else:
+                    alive_1 = False
+                if pick_2:
+                    if random.random() > win_chance_2:
+                        alive_2 = False
+                else:
+                    alive_2 = False
+                ut1.add(pick_1)
+                ut2.add(pick_2)
+                # If both are dead, stop early
+                if not alive_1 and not alive_2:
+                    break
+            # Count if at least one entry survived all weeks
+            if alive_1 or alive_2:
+                survival_count += 1
+        return survival_count / num_simulations if num_simulations > 0 else 0.0
+
+    def simulate_multi_entry_survivor_paths(
+        self,
+        start_week: int,
+        num_simulations: int = 10000,
+        num_entries: int = 2,
+        used_teams: Optional[List[set]] = None,
+        random_seed: Optional[int] = None
+    ) -> float:
+        """
+        Simulate multiple survivor paths for N entries using Monte Carlo.
+        Returns the estimated probability that at least one entry survives all weeks.
+        """
+        if random_seed is not None:
+            random.seed(random_seed)
+        survival_count = 0
+        for _ in range(num_simulations):
+            uts = [set(used_teams[i]) if used_teams and i < len(used_teams) else set() for i in range(num_entries)]
+            alive = [True] * num_entries
+            for week in range(start_week, 19):
+                week_games = [g for g in self.schedule if g.week == week]
+                # Build candidate picks for each entry (teams not yet used)
+                candidates = []
+                for i in range(num_entries):
+                    entry_candidates = []
+                    for g in week_games:
+                        if g.win_prob_home is None or g.win_prob_away is None:
+                            continue
+                        if g.win_prob_home >= g.win_prob_away:
+                            fav_team = g.home
+                            win_prob = g.win_prob_home
+                        else:
+                            fav_team = g.away
+                            win_prob = g.win_prob_away
+                        if fav_team not in uts[i]:
+                            entry_candidates.append((fav_team, win_prob))
+                    candidates.append(entry_candidates)
+                # Assign picks for each entry, avoiding duplicate picks in the same week if possible
+                picks = [None] * num_entries
+                picked_teams = set()
+                for i in range(num_entries):
+                    entry_candidates = [c for c in candidates[i] if c[0] not in picked_teams]
+                    if not entry_candidates:
+                        entry_candidates = candidates[i]
+                    if entry_candidates:
+                        teams, probs = zip(*entry_candidates)
+                        weights = [p / sum(probs) for p in probs]
+                        pick = random.choices(teams, weights=weights, k=1)[0]
+                        picks[i] = pick
+                        picked_teams.add(pick)
+                # Simulate win/loss for each entry
+                for i in range(num_entries):
+                    if not alive[i]:
+                        continue
+                    pick = picks[i]
+                    win_chance = dict(candidates[i]).get(pick, 0) if pick else 0
+                    if pick:
+                        if random.random() > win_chance:
+                            alive[i] = False
+                    else:
+                        alive[i] = False
+                    uts[i].add(pick)
+                if not any(alive):
+                    break
+            if any(alive):
+                survival_count += 1
+        return survival_count / num_simulations if num_simulations > 0 else 0.0
+
     # ---------------------------------------------------------------------
     # Live data integration
     #
@@ -714,6 +866,9 @@ def main():
     parser.add_argument('--week', type=int, default=1, help='Week number to generate picks for')
     parser.add_argument('--update-elo', action='store_true', help='Update Elo ratings using live results up to this week')
     parser.add_argument('--use-betting-lines', action='store_true', help='Fetch and apply live betting lines for this week')
+    parser.add_argument('--simulate-survival', action='store_true', help='Estimate probability at least one entry survives the season')
+    parser.add_argument('--simulations', type=int, default=10000, help='Number of Monte Carlo simulations to run')
+    parser.add_argument('--entries', type=int, default=2, help='Number of survivor entries')
     args = parser.parse_args()
     raw_schedule = load_manual_schedule()
     games = [Game(**g) for g in raw_schedule if g['week'] <= 18]
@@ -723,7 +878,12 @@ def main():
             results = fetch_weekly_scores(2025, wk)
             if results:
                 update_elo_ratings(team_ratings, results)
-    picker = SURVIVOR_PICKER(games, team_ratings=team_ratings)
+    picker = SURVIVOR_PICKER(
+        games,
+        team_ratings=team_ratings,
+        used_teams_entry1=list(PICKS[0]) if len(PICKS) > 0 else [],
+        used_teams_entry2=list(PICKS[1]) if len(PICKS) > 1 else []
+    )
     # --- Fetch and apply betting lines if requested ---
     if args.use_betting_lines:
         betting_lines = fetch_betting_lines(args.week)
@@ -738,6 +898,19 @@ def main():
     for team, prob, pop, fv, ev in summary:
         print(f"{team:24s}  P(win)={prob:.3f}  Pop={pop:.2f}  FV={fv:.2f}  EV={ev:.3f}")
 
+    if args.simulate_survival:
+        # Prepare used_teams as a list of sets for each entry
+        used_teams = [set(picks) if i < len(PICKS) else set() for i, picks in enumerate(PICKS[:args.entries])]
+        # Pad with empty sets if not enough PICK lists provided
+        while len(used_teams) < args.entries:
+            used_teams.append(set())
+        prob = picker.simulate_multi_entry_survivor_paths(
+            start_week=args.week,
+            num_simulations=args.simulations,
+            num_entries=args.entries,
+            used_teams=used_teams
+        )
+        print(f"\nEstimated probability at least one entry survives the season: {prob:.2%}")
 
 if __name__ == '__main__':
     main()
