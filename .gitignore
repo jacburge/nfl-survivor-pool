@@ -12,7 +12,7 @@ version: 1.0
 *.pyo
 # Virtual environment directories
 venv/
-.env/   
+.env   
 # IDE and editor specific files
 .idea/
 .vscode/
