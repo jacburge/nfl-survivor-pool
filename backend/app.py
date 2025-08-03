@@ -2,24 +2,30 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from nfl_survivor_tool import SURVIVOR_PICKER, compute_team_ratings, load_manual_schedule
 from nfl_survivor_tool import Game
+import ast
+import json
 
 app = Flask(__name__)
 CORS(app)
+
+PICKS_FILE = "picks.json"
 
 @app.route('/api/summary')
 def get_summary():
     try:
         week = int(request.args.get('week', 1))
         entries = int(request.args.get('entries', 2))
+        use_betting = request.args.get('betting', 'false').lower() == 'true'
         raw_schedule = load_manual_schedule()
         games = [Game(**g) for g in raw_schedule if g['week'] <= 18]
-        team_ratings = compute_team_ratings()
-
+        if use_betting:
+            team_ratings = compute_team_ratings(use_betting_lines=True)
+        else:
+            team_ratings = compute_team_ratings()
         picker = SURVIVOR_PICKER(
             schedule=games,
             team_ratings=team_ratings,
-            used_teams_entry1=[],
-            used_teams_entry2=[]
+            used_teams_per_entry=[[] for _ in range(entries)]
         )
         picker.update_situational_factors()
         picker.recommend_picks(week)
@@ -56,8 +62,7 @@ def simulate():
         picker = SURVIVOR_PICKER(
             schedule=games,
             team_ratings=team_ratings,
-            used_teams_entry1=[],
-            used_teams_entry2=[]
+            used_teams_per_entry=[[] for _ in range(entries)]
         )
         picker.update_situational_factors()
 
@@ -81,6 +86,50 @@ def simulate():
         return jsonify({"curve": formatted_curve})
     except Exception as e:
         print("Error in /api/simulate:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/picks', methods=['GET'])
+def get_picks():
+    try:
+        with open(PICKS_FILE, "r") as f:
+            picks = json.load(f)
+    except Exception:
+        picks = []
+    return jsonify({"picks": picks})
+
+@app.route('/api/picks', methods=['POST'])
+def save_picks():
+    try:
+        data = request.json
+        week = int(data.get("week"))
+        selected_teams = data.get("selectedTeams", [])
+        entries = int(data.get("entries", len(selected_teams)))
+
+        # Load current picks
+        try:
+            with open(PICKS_FILE, "r") as f:
+                picks = json.load(f)
+        except Exception:
+            picks = []
+
+        # Ensure correct shape
+        while len(picks) < entries:
+            picks.append([])
+        for entry in picks:
+            while len(entry) < week:
+                entry.append(None)
+
+        # Update only the current week for each entry
+        for i, team in enumerate(selected_teams):
+            picks[i][week - 1] = team
+
+        # Write back to picks.json
+        with open(PICKS_FILE, "w") as f:
+            json.dump(picks, f)
+
+        return jsonify({"success": True, "picks": picks})
+    except Exception as e:
+        print("Error saving picks:", e)
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':

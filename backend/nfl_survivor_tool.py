@@ -14,7 +14,7 @@ Key features:
 - Live betting lines: Optionally fetch and apply current point spreads
 - Injury adjustments: Optionally apply Elo penalties for injured players (see injuries.py)
 - Pick popularity: Heuristic or real data (if available)
-- Supports multiple entries: Track and simulate any number of entries (see picks.py)
+- Supports multiple entries: Track and simulate any number of entries (see picks.json)
 - Monte Carlo simulation: Estimate probability at least one entry survives the season
 
 To use this module, execute it as a script. It will print recommended picks for each entry for a given week,
@@ -34,7 +34,7 @@ Example usage:
     # Simulate survival odds for 3 entries with 50,000 simulations
     python3 nfl_survivor_tool.py --week 1 --simulate-survival --entries 3 --simulations 50000
 
-Edit picks.py to track your picks for each entry, and injuries.py to specify Elo penalties for injuries.
+Edit picks.json to track your picks for each entry, and injuries.py to specify Elo penalties for injuries.
 The tool will always avoid recommending teams you've already picked.
 
 """
@@ -54,13 +54,8 @@ from injuries import INJURIES
 
 import os
 from dotenv import load_dotenv
-from picks import PICKS
+import json
 
-# The requests and BeautifulSoup imports are retained for potential future use,
-# but the current implementation no longer scrapes the schedule from FFToday.
-# Wrap these imports in try/except so that the module still loads even if
-# requests or bs4 are not installed on the user's system.  These packages
-# are only required if you intend to re‑enable web scraping.
 try:
     from bs4 import BeautifulSoup  # noqa: F401
 except ImportError:
@@ -70,12 +65,6 @@ except ImportError:
 # Data definitions
 ###############################################################################
 
-# Team power ratings derived from the 2024 final win‑loss records.  Each team
-# begins at a base of 1500 Elo points and receives ±30 points for every win
-# above or below .500 (i.e. every win more than losses adds 30 points).  The
-# list was transcribed from Pro‑Football‑Reference's 2024 standings
-# (see report citations).  Teams are keyed by their full names as they
-# appear on FFToday's schedule page.
 def compute_team_ratings() -> Dict[str, float]:
     base = 1500
     scale = 30
@@ -338,8 +327,7 @@ class SURVIVOR_PICKER:
     """Class encapsulating survivor pool modelling and optimisation."""
     schedule: List[Game]
     team_ratings: Dict[str, float] = field(default_factory=compute_team_ratings)
-    used_teams_entry1: List[str] = field(default_factory=list)
-    used_teams_entry2: List[str] = field(default_factory=list)
+    used_teams_per_entry: List[List[str]] = field(default_factory=list)
 
     def update_situational_factors(self) -> None:
         """Compute situational advantages and win probabilities for each game.
@@ -435,7 +423,7 @@ class SURVIVOR_PICKER:
                 fv += g.win_prob_away
         return fv
 
-    def recommend_picks(self, week: int) -> Tuple[Optional[str], Optional[str]]:
+    def recommend_picks(self, week: int) -> List[Optional[str]]:
         """Recommend two teams for the given week based on EV and diversification.
 
         Returns a tuple (pick_entry1, pick_entry2).  If there are fewer than
@@ -444,85 +432,47 @@ class SURVIVOR_PICKER:
         # Filter games for the specified week
         week_games = [g for g in self.schedule if g.week == week]
         if not week_games:
-            return (None, None)
+            return [None for _ in range(len(self.used_teams_per_entry))]
         # Compute popularity scores for this week's games
         self.compute_pick_popularity(week_games)
-        # Evaluate EV for each game (from the perspective of picking the home
-        # favourite).  Exclude teams already used by each entry.
-        candidates = []
-        for g in week_games:
-            # Determine which team is favourite (we treat home team as the default
-            # survivor pick because the model builds win_prob_home; if the home
-            # probability is below 0.5 we invert the matchup).
-            if g.win_prob_home is None or g.win_prob_away is None:
-                continue
-            # Choose favourite team and associated probability
-            if g.win_prob_home >= g.win_prob_away:
-                fav_team = g.home
-                fav_prob = g.win_prob_home
-                opp_prob = g.win_prob_away
-            else:
-                fav_team = g.away
-                fav_prob = g.win_prob_away
-                opp_prob = g.win_prob_home
-            # Skip if favourite has already been used by both entries
-            used_both = fav_team in self.used_teams_entry1 and fav_team in self.used_teams_entry2
-            if used_both:
-                continue
-            # Compute popularity (if popularity corresponds to home probability we approximate
-            # by using g.popularity; invert if away favourite)
-            popularity = g.popularity or 0.1
-            if fav_team == g.away:
-                # assign same popularity as home game for simplicity
-                popularity = popularity  # no change
-            # Estimate future value of saving this team
-            fv = self.future_value(fav_team, week)
-            # Compute expected value: win_prob * (1 - popularity) - small penalty for burning future value
-            ev = fav_prob * (1 - popularity) - fv * 0.05
-            candidates.append({
-                'game': g,
-                'team': fav_team,
-                'prob': fav_prob,
-                'pop': popularity,
-                'ev': ev,
-            })
-        if not candidates:
-            return (None, None)
-        # Sort candidates by EV descending
-        candidates.sort(key=lambda d: d['ev'], reverse=True)
-        # Select picks for entry1 and entry2, ensuring different teams if possible
-        pick1 = None
-        pick2 = None
-        for cand in candidates:
-            team = cand['team']
-            if team in self.used_teams_entry1:
-                continue
-            pick1 = team
-            break
-        # Find a different team for entry2
-        for cand in candidates:
-            team = cand['team']
-            if team == pick1:
-                continue
-            if team in self.used_teams_entry2:
-                continue
-            pick2 = team
-            break
-        # Fall back: if unable to find a second unique team, allow duplicate
-        if not pick2 and candidates:
-            for cand in candidates:
-                team = cand['team']
-                if team != pick1:
-                    pick2 = team
-                    break
-        # Update used teams lists
-        if pick1:
-            self.used_teams_entry1.append(pick1)
-        if pick2:
-            self.used_teams_entry2.append(pick2)
-        return (pick1, pick2)
+        picks = []
+        for entry_idx, used_teams in enumerate(self.used_teams_per_entry):
+            candidates = []
+            for g in week_games:
+                # Determine which team is favourite (we treat home team as the default
+                # survivor pick because the model builds win_prob_home; if the home
+                # probability is below 0.5 we invert the matchup).
+                if g.win_prob_home is None or g.win_prob_away is None:
+                    continue
+                # Choose favourite team and associated probability
+                if g.win_prob_home >= g.win_prob_away:
+                    fav_team = g.home
+                    fav_prob = g.win_prob_home
+                    opp_prob = g.win_prob_away
+                else:
+                    fav_team = g.away
+                    fav_prob = g.win_prob_away
+                    opp_prob = g.win_prob_home
+                # Skip if favourite has already been used by both entries
+                used_both = fav_team in self.used_teams_per_entry[0] and fav_team in self.used_teams_per_entry[1]
+                if used_both:
+                    continue
+                # Compute popularity (if popularity corresponds to home probability we approximate
+                # by using g.popularity; invert if away favourite)
+                popularity = g.popularity or 0.1
+                if fav_team == g.away:
+                    # assign same popularity as home game for simplicity
+                    popularity = popularity  # no change
+                # Estimate future value of saving this team
+                fv = self.future_value(fav_team, week)
+                # Compute expected value: win_prob * (1 - popularity) - small penalty for burning future value
+                ev = fav_prob * (1 - popularity) - fv * 0.05
+                candidates.append((fav_team, ev))
+            candidates.sort(key=lambda t: t[1], reverse=True)
+            picks.append(candidates[0][0] if candidates else None)
+        return picks
 
-    def summary_for_week(self, week: int) -> List[Tuple[str, float, float, float]]:
+    def summary_for_week(self, week: int) -> List[Tuple[str, float, float, float, float]]:
         """Return a summary of win probability, popularity and EV for the week's games.
 
         Returns a list of tuples: (fav_team, win_prob, popularity, future_value)
@@ -944,35 +894,51 @@ def main():
     raw_schedule = load_manual_schedule()
     games = [Game(**g) for g in raw_schedule if g['week'] <= 18]
     team_ratings = compute_team_ratings()
+
+    # Load picks.json
+    try:
+        with open("picks.json", "r") as f:
+            PICKS = json.load(f)
+    except Exception:
+        PICKS = []
+
+    # Build used_teams_per_entry for all entries up to the current week
+    used_teams_per_entry = [
+        [team for team in entry[:args.week-1] if team]
+        for entry in PICKS[:args.entries]
+    ]
+    while len(used_teams_per_entry) < args.entries:
+        used_teams_per_entry.append([])
+
+    picker = SURVIVOR_PICKER(
+        schedule=games,
+        team_ratings=team_ratings,
+        used_teams_per_entry=used_teams_per_entry
+    )
+
     if args.update_elo:
         for wk in range(1, args.week):
             results = fetch_weekly_scores(2025, wk)
             if results:
                 update_elo_ratings(team_ratings, results)
-    picker = SURVIVOR_PICKER(
-        schedule=games,
-        team_ratings=team_ratings,
-        used_teams_entry1=list(PICKS[0]) if len(PICKS) > 0 else [],
-        used_teams_entry2=list(PICKS[1]) if len(PICKS) > 1 else []
-    )
-    # --- Fetch and apply betting lines if requested ---
+
     if args.use_betting_lines:
         betting_lines = fetch_betting_lines(args.week)
         if betting_lines:
             picker.apply_betting_lines(betting_lines)
-    # --------------------------------------------------
+
     picker.update_situational_factors()
-    pick1, pick2 = picker.recommend_picks(args.week)
-    print(f"Recommended picks for week {args.week}: Entry1 = {pick1}, Entry2 = {pick2}")
+    picks = picker.recommend_picks(args.week)
+    for idx, pick in enumerate(picks):
+        print(f"Recommended pick for Entry {idx+1} (week {args.week}): {pick}")
+
     summary = picker.summary_for_week(args.week)
     print("\nSummary (team, winProb, popularity, futureValue, EV):")
     for team, prob, pop, fv, ev in summary:
         print(f"{team:24s}  P(win)={prob:.3f}  Pop={pop:.2f}  FV={fv:.2f}  EV={ev:.3f}")
 
     if args.simulate_survival:
-        # Prepare used_teams as a list of sets for each entry
         used_teams = [set(picks) if i < len(PICKS) else set() for i, picks in enumerate(PICKS[:args.entries])]
-        # Pad with empty sets if not enough PICK lists provided
         while len(used_teams) < args.entries:
             used_teams.append(set())
         prob = picker.simulate_multi_entry_survivor_paths(
@@ -982,6 +948,7 @@ def main():
             used_teams=used_teams
         )
         print(f"\nEstimated probability at least one entry survives the season: {prob:.2%}")
+
     if INJURIES:
         picker.apply_injury_reports(INJURIES)
 

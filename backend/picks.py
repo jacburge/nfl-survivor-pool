@@ -2,8 +2,4 @@
 # Use team names as strings, e.g. "Philadelphia Eagles"
 # Example: PICKS = [["Team1", "Team2"], ["Team3", "Team4"], ...] for each entry
 
-PICKS = [
-    [],      # Entry 1
-    [],  # Entry 2
-    # Add more lists for more entries if desired
-]
+PICKS = None
