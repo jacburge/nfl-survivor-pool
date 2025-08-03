@@ -37,13 +37,13 @@ Example usage:
 Edit picks.py to track your picks for each entry, and injuries.py to specify Elo penalties for injuries.
 The tool will always avoid recommending teams you've already picked.
 
-You are encouraged to inspect and modify the code to suit your needs.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import math
+import matplotlib.pyplot as plt
 import re
 import random
 from dataclasses import dataclass, field
@@ -700,6 +700,66 @@ class SURVIVOR_PICKER:
                 survival_count += 1
         return survival_count / num_simulations if num_simulations > 0 else 0.0
 
+    def plot_survival_curve(self, start_week=1, num_simulations=10000, num_entries=2, used_teams=None):
+        survival_by_week = [0] * (19 - start_week)
+        
+        for _ in range(num_simulations):
+            uts = [set(used_teams[i]) if used_teams and i < len(used_teams) else set() for i in range(num_entries)]
+            alive = [True] * num_entries
+
+            for week_offset, week in enumerate(range(start_week, 19)):
+                if not any(alive):
+                    break
+                week_games = [g for g in self.schedule if g.week == week]
+                candidates = []
+                for i in range(num_entries):
+                    entry_candidates = []
+                    for g in week_games:
+                        if g.win_prob_home is None or g.win_prob_away is None:
+                            continue
+                        fav_team = g.home if g.win_prob_home >= g.win_prob_away else g.away
+                        win_prob = g.win_prob_home if fav_team == g.home else g.win_prob_away
+                        if fav_team not in uts[i]:
+                            entry_candidates.append((fav_team, win_prob))
+                    candidates.append(entry_candidates)
+
+                picks = [None] * num_entries
+                picked_teams = set()
+                for i in range(num_entries):
+                    entry_candidates = [c for c in candidates[i] if c[0] not in picked_teams] or candidates[i]
+                    if entry_candidates:
+                        teams, probs = zip(*entry_candidates)
+                        weights = [p / sum(probs) for p in probs]
+                        pick = random.choices(teams, weights=weights, k=1)[0]
+                        picks[i] = pick
+                        picked_teams.add(pick)
+
+                for i in range(num_entries):
+                    if not alive[i]: continue
+                    pick = picks[i]
+                    win_chance = dict(candidates[i]).get(pick, 0)
+                    if random.random() > win_chance:
+                        alive[i] = False
+                    uts[i].add(pick)
+
+                if any(alive):
+                    survival_by_week[week_offset] += 1
+
+        # Normalize to percentage
+        survival_pct = [s / num_simulations * 100 for s in survival_by_week]
+        weeks = list(range(start_week, 19))
+        
+        # Plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(weeks, survival_pct, marker='o')
+        plt.title('Simulated Survivor Odds (At Least 1 Entry Alive)')
+        plt.xlabel('Week')
+        plt.ylabel('Survival %')
+        plt.grid(True)
+        plt.xticks(weeks)
+        plt.ylim(0, 100)
+        plt.tight_layout()
+        plt.show()
     # ---------------------------------------------------------------------
     # Live data integration
     #
@@ -831,6 +891,42 @@ def fetch_betting_lines(week: int) -> dict:
     except Exception as e:
         print(f"Could not fetch betting lines: {e}")
         return {}
+    
+def plot_summary_bubble_chart(summary_data):
+    import matplotlib.pyplot as plt
+
+    teams = [row[0] for row in summary_data]
+    win_probs = [row[1] for row in summary_data]
+    popularities = [row[2] for row in summary_data]
+    future_values = [row[3] for row in summary_data]
+    expected_values = [row[4] for row in summary_data]
+    sizes = [abs(ev) * 1000 for ev in expected_values]  # Bubble sizes
+
+    plt.figure(figsize=(12, 8))
+    scatter = plt.scatter(win_probs, future_values, s=sizes, c=popularities,
+                        cmap='coolwarm', alpha=0.7)
+
+    # Add team labels
+    for i, team in enumerate(teams):
+        plt.text(win_probs[i] + 0.005, future_values[i] + 0.1, team, fontsize=9)
+
+    # Add colorbar for popularity
+    cbar = plt.colorbar(scatter)
+    cbar.set_label('Pick Popularity')
+
+    # Add legend for expected value (bubble size)
+    for ev in [0.1, 0.3, 0.5]:
+        plt.scatter([], [], s=ev * 1000, c='gray', alpha=0.5,
+                    label=f'EV {ev:+.1f}')
+    plt.legend(scatterpoints=1, frameon=True, labelspacing=1,
+            title='Expected Value (bubble size)')
+
+    plt.xlabel('Win Probability')
+    plt.ylabel('Future Value')
+    plt.title('Weekly Pick Summary: Win Probability vs. Future Value')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
 
 def main():
@@ -842,6 +938,8 @@ def main():
     parser.add_argument('--simulate-survival', action='store_true', help='Estimate probability at least one entry survives the season')
     parser.add_argument('--simulations', type=int, default=10000, help='Number of Monte Carlo simulations to run')
     parser.add_argument('--entries', type=int, default=2, help='Number of survivor entries')
+    parser.add_argument('--plot-survival', action='store_true', help='Show survival % over time')
+    parser.add_argument('--plot-summary', action='store_true', help='Visualize summary of weekly pick recommendations')
     args = parser.parse_args()
     raw_schedule = load_manual_schedule()
     games = [Game(**g) for g in raw_schedule if g['week'] <= 18]
@@ -886,6 +984,17 @@ def main():
         print(f"\nEstimated probability at least one entry survives the season: {prob:.2%}")
     if INJURIES:
         picker.apply_injury_reports(INJURIES)
+
+    if args.plot_survival:
+        picker.plot_survival_curve(
+            start_week=args.week,
+            num_simulations=args.simulations,
+            num_entries=args.entries,
+            used_teams=[set(p) for p in PICKS[:args.entries]]
+        )
+
+    if args.plot_summary:
+        plot_summary_bubble_chart(summary)
 
 if __name__ == '__main__':
     main()
