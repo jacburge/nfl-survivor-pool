@@ -55,6 +55,7 @@ from injuries import INJURIES
 import os
 from dotenv import load_dotenv
 import json
+import itertools
 
 try:
     from bs4 import BeautifulSoup  # noqa: F401
@@ -471,6 +472,65 @@ class SURVIVOR_PICKER:
             candidates.sort(key=lambda t: t[1], reverse=True)
             picks.append(candidates[0][0] if candidates else None)
         return picks
+
+    def recommend_diversified_picks(self, week, fv_weight=0.15, ev_weight=1.0, pop_weight=0.5):
+        week_games = [g for g in self.schedule if g.week == week]
+
+        available_teams_per_entry = []
+        team_info_per_entry = []
+
+        for used_teams in self.used_teams_per_entry:
+            options = []
+            info = []
+            for g in week_games:
+                for team, prob in [(g.home, g.win_prob_home), (g.away, g.win_prob_away)]:
+                    if team not in used_teams and team not in options:
+                        fv = self.future_value(team, week)
+                        pop = g.popularity or 0.1
+                        ev = prob * (1 - pop) - fv * fv_weight
+                        options.append(team)
+                        info.append({
+                            "team": team,
+                            "prob": prob,
+                            "future_value": fv,
+                            "popularity": pop,
+                            "expected_value": ev
+                        })
+            available_teams_per_entry.append(options)
+            team_info_per_entry.append(info)
+
+        best_combo = None
+        best_score = -float("inf")
+
+        for picks in itertools.product(*available_teams_per_entry):
+            if len(set(picks)) < len(picks):
+                continue  # Avoid duplicate picks across entries
+
+            probs, fvs, evs, pops = [], [], [], []
+            for i, team in enumerate(picks):
+                idx = available_teams_per_entry[i].index(team)
+                info = team_info_per_entry[i][idx]
+                probs.append(info["prob"])
+                fvs.append(info["future_value"])
+                evs.append(info["expected_value"])
+                pops.append(info["popularity"])
+
+            # Key survival objective: at least one survives
+            survival_prob = 1 - math.prod([1 - p for p in probs])
+
+            # Composite score
+            score = (
+                survival_prob +
+                ev_weight * sum(evs) +
+                pop_weight * sum(1 - p for p in pops) -  # Lower popularity is better
+                fv_weight * sum(fvs)                     # Penalize burning high-future-value teams
+            )
+
+            if score > best_score:
+                best_score = score
+                best_combo = picks
+
+        return list(best_combo) if best_combo else [None] * len(self.used_teams_per_entry)
 
     def summary_for_week(self, week: int) -> List[Tuple[str, float, float, float, float]]:
         """Return a summary of win probability, popularity and EV for the week's games.
@@ -904,8 +964,8 @@ def main():
 
     # Build used_teams_per_entry for all entries up to the current week
     used_teams_per_entry = [
-        [team for team in entry[:args.week-1] if team]
-        for entry in PICKS[:args.entries]
+        [week[entry_idx] for week in PICKS[:args.week-1] if len(week) > entry_idx and week[entry_idx]]
+        for entry_idx in range(args.entries)
     ]
     while len(used_teams_per_entry) < args.entries:
         used_teams_per_entry.append([])

@@ -4,11 +4,26 @@ from nfl_survivor_tool import SURVIVOR_PICKER, compute_team_ratings, load_manual
 from nfl_survivor_tool import Game
 import ast
 import json
+from schedule_2025 import SCHEDULE_2025
 
 app = Flask(__name__)
 CORS(app)
 
 PICKS_FILE = "picks.json"
+
+def serialize_schedule(schedule):
+    # Convert datetime.date to string for JSON
+    sched = []
+    for g in schedule:
+        g2 = dict(g)
+        if hasattr(g2['date'], 'isoformat'):
+            g2['date'] = g2['date'].isoformat()
+        sched.append(g2)
+    return sched
+
+@app.route('/api/schedule')
+def get_schedule():
+    return jsonify(serialize_schedule(SCHEDULE_2025))
 
 @app.route('/api/summary')
 def get_summary():
@@ -22,13 +37,34 @@ def get_summary():
             team_ratings = compute_team_ratings(use_betting_lines=True)
         else:
             team_ratings = compute_team_ratings()
+        
+        # Load current picks
+        try:
+            with open(PICKS_FILE, "r") as f:
+                picks = json.load(f)
+        except Exception:
+            picks = []
+
+        # Ensure correct shape
+        while len(picks) < entries:
+            picks.append([])
+        for entry in picks:
+            while len(entry) < week:
+                entry.append(None)
+
+        used_teams_per_entry = [
+            [team for team in entry[:week-1] if team]
+            for entry in picks[:entries]
+        ]
+        while len(used_teams_per_entry) < entries:
+            used_teams_per_entry.append([])
         picker = SURVIVOR_PICKER(
             schedule=games,
             team_ratings=team_ratings,
-            used_teams_per_entry=[[] for _ in range(entries)]
+            used_teams_per_entry=used_teams_per_entry
         )
         picker.update_situational_factors()
-        picker.recommend_picks(week)
+        recommended_picks = picker.recommend_diversified_picks(week)
         summary = picker.summary_for_week(week)
 
         # Ensure summary is a list of dicts with the correct keys
@@ -44,7 +80,10 @@ def get_summary():
                 "expected_value": expected_value,
             })
 
-        return jsonify({"summary": formatted})
+        return jsonify({
+            "recommended_picks": recommended_picks,
+            "summary": formatted
+        })
     except Exception as e:
         print("Error in /api/summary:", e)
         return jsonify({"error": str(e)}), 500
@@ -101,32 +140,11 @@ def get_picks():
 def save_picks():
     try:
         data = request.json
-        week = int(data.get("week"))
-        selected_teams = data.get("selectedTeams", [])
-        entries = int(data.get("entries", len(selected_teams)))
-
-        # Load current picks
-        try:
-            with open(PICKS_FILE, "r") as f:
-                picks = json.load(f)
-        except Exception:
-            picks = []
-
-        # Ensure correct shape
-        while len(picks) < entries:
-            picks.append([])
-        for entry in picks:
-            while len(entry) < week:
-                entry.append(None)
-
-        # Update only the current week for each entry
-        for i, team in enumerate(selected_teams):
-            picks[i][week - 1] = team
-
-        # Write back to picks.json
+        picks = data.get("picks")  # [week][entry]
+        if not picks:
+            return jsonify({"error": "No picks provided"}), 400
         with open(PICKS_FILE, "w") as f:
             json.dump(picks, f)
-
         return jsonify({"success": True, "picks": picks})
     except Exception as e:
         print("Error saving picks:", e)
