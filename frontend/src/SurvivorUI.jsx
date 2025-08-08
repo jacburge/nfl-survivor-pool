@@ -17,6 +17,7 @@ import {
   Line,
   ReferenceLine
 } from "recharts";
+import picksData from "../../backend/picks.json"; // Adjust path if needed
 
 function LoadingSpinner() {
   return (
@@ -124,23 +125,32 @@ export default function SurvivorUI() {
   const [sortDirection, setSortDirection] = useState("desc");
   const [recommendedPicks, setRecommendedPicks] = useState([]);
   const [showTop2, setShowTop2] = useState(false);
-  const [editPicks, setEditPicks] = useState([]); // [ [team, team, ...], ... ] for each entry
+  const [editPicks, setEditPicks] = useState([]);
+  const [saveLoading, setSaveLoading] = useState(false);
   const [schedule, setSchedule] = useState([]);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [picks, setPicks] = useState([]);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [fvWeight, setFvWeight] = useState(0.5);
+  const [evWeight, setEvWeight] = useState(1);
+  const [popWeight, setPopWeight] = useState(1);
+  const [showSummary, setShowSummary] = useState(false);
+  const [showAllPicks, setShowAllPicks] = useState(false);
 
-  // Fetch picks on mount and when entries changes
+  // Track selected picks per entry for the current week
+  const [entrySelections, setEntrySelections] = useState(Array(entries).fill(""));
+
+  // Reset selections when week or entries change
   useEffect(() => {
-    fetch('/api/picks')
+    setEntrySelections(Array(entries).fill(""));
+  }, [week, entries]);
+
+  // Fetch picks on mount and when week/entries change
+  useEffect(() => {
+    fetch("/api/picks")
       .then(res => res.json())
-      .then(data => {
-        let picks = data.picks || [];
-        if (picks.length < entries) {
-          picks = [...picks, ...Array(entries - picks.length).fill([])];
-        } else if (picks.length > entries) {
-          picks = picks.slice(0, entries);
-        }
-        setUserPicks(picks);
-      });
-  }, [entries, week]);
+      .then(data => setPicks(data.picks || []));
+  }, [week, entries]);
 
   // Initialize editPicks when userPicks or week changes
   useEffect(() => {
@@ -154,15 +164,24 @@ export default function SurvivorUI() {
       .then(data => setSchedule(data));
   }, []);
 
+  // Load picks.json on mount
+  useEffect(() => {
+    setEditPicks(picksData);
+  }, []);
+
   const fetchSummary = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/summary?week=${week}&entries=${entries}&betting=${useBetting}`);
+      const res = await fetch(
+        `/api/summary?week=${week}&entries=${entries}&betting=${useBetting}&fv_weight=${fvWeight}&ev_weight=${evWeight}&pop_weight=${popWeight}`
+      );
       const data = await res.json();
       const sorted = [...data.summary].sort((a, b) => b.expected_value - a.expected_value);
       setSummaryData(sorted);
       setRecommendedPicks(data.recommended_picks || []);
       setTopPicks(sorted.slice(0, 2));
+      setShowSummary(true);    // Show summary card after fetching
+      setShowAllPicks(true);   // Show all picks card after fetching
     } catch (err) {
       console.error("Error fetching summary:", err);
     }
@@ -181,8 +200,31 @@ export default function SurvivorUI() {
     setLoading(false);
   };
 
+  // Update a pick for a specific entry/week
+  function handlePickChange(entryIdx, weekIdx, value) {
+    setEditPicks(prev =>
+      prev.map((entry, i) =>
+        i === entryIdx
+          ? entry.map((pick, j) => (j === weekIdx ? value : pick))
+          : entry
+      )
+    );
+  }
+
+  // Save picks.json (requires backend API endpoint to write file)
+  async function handleSavePicks() {
+    setSaveLoading(true);
+    await fetch("/api/save-picks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(editPicks),
+    });
+    setSaveLoading(false);
+    // Optionally reload picks from backend
+  }
+
   // Handler for dropdown change
-  const handlePickChange = (weekIdx, entryIdx, team) => {
+  const handleDropdownChange = (weekIdx, entryIdx, team) => {
     setEditPicks(prev => {
       const updated = prev.map(arr => [...arr]);
       updated[weekIdx][entryIdx] = team;
@@ -215,22 +257,68 @@ export default function SurvivorUI() {
     });
   };
 
-  // Save picks for current week
-  const savePicks = async () => {
-    await fetch('/api/picks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ week, selectedTeams, entries }),
+  // Handle checkbox change for an entry/team
+  function handleEntryCheckbox(entryIdx, team) {
+    // Check if this team is already picked for this entry in any week
+    let duplicate = false;
+    if (picks[entryIdx] && picks[entryIdx].includes(team)) {
+      duplicate = true;
+    }
+    // Also check if selected for another entry this week
+    if (entrySelections.includes(team) && entrySelections[entryIdx] !== team) {
+      duplicate = true;
+    }
+    if (duplicate) {
+      setErrorMsg(`"${team}" has already been picked for Entry ${entryIdx + 1}. Please select a new team.`);
+      return;
+    }
+    setErrorMsg("");
+    setEntrySelections(prev => {
+      const updated = [...prev];
+      updated[entryIdx] = updated[entryIdx] === team ? "" : team;
+      return updated;
     });
-    // Refresh picks after saving
-    fetch('/api/picks')
-      .then(res => res.json())
-      .then(data => setUserPicks(data.picks || []));
-    setSelectedTeams([]);
+  }
+
+  // Save picks for the current week
+  async function handleSaveWeekPicks() {
+    // Load existing picks.json from backend
+    let picks = [];
+    try {
+      const res = await fetch("/api/picks");
+      const data = await res.json();
+      picks = data.picks || [];
+    } catch {
+      picks = [];
+    }
+    // Ensure picks array has enough weeks
+    while (picks.length < entries) {
+      picks.push([]);
+    }
+    // Overwrite picks for this week
+    for (let i = 0; i < entries; i++) {
+      if (!picks[i]) picks[i] = [];
+      // Prevent duplicate team in entry's picks
+      const entryPicks = [...picks[i]];
+      entryPicks[week - 1] = entrySelections[i] || null;
+      // Remove duplicates in entry's picks
+      const seen = new Set();
+      picks[i] = entryPicks.map(t => {
+        if (t && seen.has(t)) return null;
+        if (t) seen.add(t);
+        return t;
+      });
+    }
+    // Save to backend
+    await fetch("/api/save-picks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(picks),
+    });
     setShowToast(true);
     if (toastTimeout.current) clearTimeout(toastTimeout.current);
     toastTimeout.current = setTimeout(() => setShowToast(false), 3000);
-  };
+  }
 
   const handleSort = (column) => {
     if (sortColumn === column) {
@@ -352,26 +440,78 @@ export default function SurvivorUI() {
               </button> */}
             </div>
           </form>
+
+          {/* Add these inside your pool configuration SectionCard
+          <div>
+            <label className="block text-sm font-medium text-blue-700 mb-1">Future Value Weight</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              max="1"
+              value={fvWeight}
+              onChange={e => setFvWeight(Number(e.target.value))}
+              className="block w-full rounded-md border-blue-300 shadow-sm px-3 py-2"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-blue-700 mb-1">Expected Value Weight</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              max="2"
+              value={evWeight}
+              onChange={e => setEvWeight(Number(e.target.value))}
+              className="block w-full rounded-md border-blue-300 shadow-sm px-3 py-2"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-blue-700 mb-1">Popularity Weight</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              max="2"
+              value={popWeight}
+              onChange={e => setPopWeight(Number(e.target.value))}
+              className="block w-full rounded-md border-blue-300 shadow-sm px-3 py-2"
+            />
+          </div> */}
         </SectionCard>
 
-        {/* Recommended Picks Card (always shown if available)
+        {/*Recommended Picks Card (always shown if available)*/}
         {recommendedPicks.length > 0 && (
-          <SectionCard title="Recommended Picks This Week">
-            <div className="flex overflow-x-auto gap-4 pb-2">
-              {recommendedPicks.map((pick, idx) => (
-                <div
-                  key={idx}
-                  className="min-w-[220px] flex-shrink-0 bg-gradient-to-br from-blue-100 via-white to-red-100 rounded-lg shadow p-4 border border-blue-200"
-                >
-                  <div className="flex items-center mb-2">
-                    <span className="text-2xl font-bold text-blue-700 mr-2">Entry {idx + 1}</span>
+          <SectionCard title="Recommended Picks This Week" icon={<Star className="text-yellow-400" />}>
+            <div className="flex flex-col md:flex-row gap-4">
+              {recommendedPicks.map((pick, idx) => {
+                // Find the full pick data from summaryData
+                const pickData = summaryData.find(team => team.team === pick);
+                return (
+                  <div
+                    key={idx}
+                    className="flex-1 bg-gradient-to-br from-blue-100 via-white to-red-100 rounded-lg shadow p-4 border border-blue-200"
+                  >
+                    <div className="flex items-center mb-2">
+                      <span className="text-2xl font-bold text-blue-700 mr-2">{idx + 1}.</span>
+                      <span className="text-xl font-semibold text-red-600">{pick || "-"}</span>
+                    </div>
+                    {pickData ? (
+                      <div className="text-sm text-gray-700">
+                        <div>Win Probability: <span className="font-bold">{(pickData.win_prob * 100).toFixed(1)}%</span></div>
+                        <div>Popularity: <span className="font-bold">{(pickData.popularity * 100).toFixed(1)}%</span></div>
+                        <div>Expected Value: <span className="font-bold">{pickData.expected_value.toFixed(2)}</span></div>
+                        <div>Future Value: <span className="font-bold">{pickData.future_value?.toFixed(2)}</span></div>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-gray-400">No data available</div>
+                    )}
                   </div>
-                  <div className="text-xl font-semibold text-red-600">{pick || "-"}</div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </SectionCard>
-        )} */}
+        )}
 
         {/* Toggle for Top 2 Picks */}
         {/* {recommendedPicks.length > 0 && (
@@ -386,7 +526,7 @@ export default function SurvivorUI() {
         )} */}
 
         {/* Top 2 Picks Card (conditionally shown) */}
-        {topPicks.length > 0 && (
+        {/* {topPicks.length > 0 && (
           <SectionCard
             title="Top 2 Picks This Week"
             icon={<Star className="text-yellow-400" />}
@@ -411,7 +551,7 @@ export default function SurvivorUI() {
               ))}
             </div>
           </SectionCard>
-        )}
+        )} */}
 
         {/* Table View */}
         {summaryData.length > 0 && (
@@ -420,171 +560,181 @@ export default function SurvivorUI() {
               <thead className="bg-gradient-to-r from-blue-100 to-red-100">
                 <tr>
                   <th></th>
-                  <th
-                    className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer"
-                    onClick={() => handleSort("team")}
-                  >
+                  <th className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer" onClick={() => handleSort("team")}>
                     Team {sortColumn === "team" && (sortDirection === "asc" ? "▲" : "▼")}
                   </th>
-                  <th
-                    className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer"
-                    onClick={() => handleSort("win_prob")}
-                  >
+                  <th className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer" onClick={() => handleSort("win_prob")}>
                     Win Prob {sortColumn === "win_prob" && (sortDirection === "asc" ? "▲" : "▼")}
                   </th>
-                  <th
-                    className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer"
-                    onClick={() => handleSort("popularity")}
-                  >
+                  <th className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer" onClick={() => handleSort("point_spread")}>
+                    Point Spread {sortColumn === "point_spread" && (sortDirection === "asc" ? "▲" : "▼")}
+                  </th>
+                  <th className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer" onClick={() => handleSort("popularity")}>
                     Popularity {sortColumn === "popularity" && (sortDirection === "asc" ? "▲" : "▼")}
                   </th>
-                  <th
-                    className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer"
-                    onClick={() => handleSort("expected_value")}
-                  >
+                  <th className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer" onClick={() => handleSort("expected_value")}>
                     Expected Value {sortColumn === "expected_value" && (sortDirection === "asc" ? "▲" : "▼")}
                   </th>
-                  <th
-                    className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer"
-                    onClick={() => handleSort("future_value")}
-                  >
+                  <th className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase cursor-pointer" onClick={() => handleSort("future_value")}>
                     Future Value {sortColumn === "future_value" && (sortDirection === "asc" ? "▲" : "▼")}
                   </th>
+                  {/* Add entry columns */}
+                  {[...Array(entries)].map((_, entryIdx) => (
+                    <th key={entryIdx} className="px-2 py-2 text-xs font-bold text-blue-700 uppercase text-center">
+                      Entry {entryIdx + 1}
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-blue-100">
                 {sortedSummaryData.map((row) => (
                   <tr key={row.team}>
-                    <td>
-                      <input
-                        type="checkbox"
-                        checked={selectedTeams.includes(row.team)}
-                        disabled={
-                          !selectedTeams.includes(row.team) &&
-                          selectedTeams.length >= entries
-                        }
-                        onChange={() => handleCheckboxChange(row.team)}
-                      />
-                    </td>
+                    <td></td>
                     <td className="px-4 py-2 font-semibold text-blue-800">{row.team}</td>
                     <td className="px-4 py-2">{(row.win_prob * 100).toFixed(1)}%</td>
+                    <td className="px-4 py-2">{row.point_spread !== null && row.point_spread !== undefined ? row.point_spread : "-"}</td>
                     <td className="px-4 py-2">{(row.popularity * 100).toFixed(1)}%</td>
                     <td className="px-4 py-2">{row.expected_value.toFixed(2)}</td>
                     <td className="px-4 py-2">{row.future_value?.toFixed(2)}</td>
+                    {/* Entry checkboxes */}
+                    {[...Array(entries)].map((_, entryIdx) => (
+                      <td key={entryIdx} className="px-2 py-2 text-center">
+                        <input
+                          type="checkbox"
+                          checked={entrySelections[entryIdx] === row.team}
+                          disabled={
+                            // Team already picked for this entry in any week (ignore nulls)
+                            (picks[entryIdx] && picks[entryIdx].filter(Boolean).includes(row.team)) ||
+                            // Team already picked for another entry this week
+                            (entrySelections.includes(row.team) && entrySelections[entryIdx] !== row.team)
+                          }
+                          onChange={() => handleEntryCheckbox(entryIdx, row.team)}
+                        />
+                      </td>
+                    ))}
                   </tr>
                 ))}
               </tbody>
             </table>
+            <button
+              className="mt-4 px-4 py-2 bg-blue-600 text-white rounded font-bold shadow hover:bg-blue-700"
+              onClick={handleSaveWeekPicks}
+              disabled={entrySelections.some(sel => !sel)}
+            >
+              Save Week {week} Picks
+            </button>
           </div>
         )}
 
-        {/* Pick Summary Graph */}
-        <SectionCard title="Weekly Pick Summary" icon={<BarChart3 className="mr-1 text-blue-600" />}>
-          {/* Legends moved to top */}
-          <div className="mb-6 flex flex-col md:flex-row items-start md:items-center gap-8">
-            {/* Color Gradient Legend for Future Value */}
-            <div className="flex items-center">
-              <span className="text-xs text-gray-700 mr-2">Future Value:</span>
-              <span className="text-xs text-gray-700 ml-2 mr-1">Low </span>
-              <div className="w-40 h-3 bg-gradient-to-r from-red-400 via-purple-400 to-blue-400 rounded" />
-              <span className="text-xs text-gray-700 ml-2">High</span>
+        {/* Weekly Pick Summary Card */}
+        {showSummary && (
+          <SectionCard title="Weekly Pick Summary" icon={<BarChart3 className="mr-1 text-blue-600" />}>
+            {/* Legends moved to top */}
+            <div className="mb-6 flex flex-col md:flex-row items-start md:items-center gap-8">
+              {/* Color Gradient Legend for Future Value */}
+              <div className="flex items-center">
+                <span className="text-xs text-gray-700 mr-2">Future Value:</span>
+                <span className="text-xs text-gray-700 ml-2 mr-1">Low </span>
+                <div className="w-40 h-3 bg-gradient-to-r from-red-400 via-purple-400 to-blue-400 rounded" />
+                <span className="text-xs text-gray-700 ml-2">High</span>
+              </div>
+              {/* Bubble Size Legend for Expected Value */}
+              <div className="flex items-center ml-8">
+                <span className="text-xs text-gray-700 mr-2">Expected Value:</span>
+                <svg width="80" height="24">
+                  <circle cx="15" cy="12" r="7" fill="#d1d5db" stroke="#2563eb" strokeWidth="1" />
+                  <circle cx="40" cy="12" r="13" fill="#d1d5db" stroke="#2563eb" strokeWidth="1" />
+                  <circle cx="70" cy="12" r="18" fill="#d1d5db" stroke="#2563eb" strokeWidth="1" />
+                </svg>
+                <span className="text-xs text-gray-700 ml-2">Low</span>
+                <span className="text-xs text-gray-700 ml-2">Med</span>
+                <span className="text-xs text-gray-700 ml-2">High</span>
+              </div>
             </div>
-            {/* Bubble Size Legend for Expected Value */}
-            <div className="flex items-center ml-8">
-              <span className="text-xs text-gray-700 mr-2">Expected Value:</span>
-              <svg width="80" height="24">
-                <circle cx="15" cy="12" r="7" fill="#d1d5db" stroke="#2563eb" strokeWidth="1" />
-                <circle cx="40" cy="12" r="13" fill="#d1d5db" stroke="#2563eb" strokeWidth="1" />
-                <circle cx="70" cy="12" r="18" fill="#d1d5db" stroke="#2563eb" strokeWidth="1" />
-              </svg>
-              <span className="text-xs text-gray-700 ml-2">Low</span>
-              <span className="text-xs text-gray-700 ml-2">Med</span>
-              <span className="text-xs text-gray-700 ml-2">High</span>
-            </div>
-          </div>
-          {loading ? (
-            <LoadingSpinner />
-          ) : summaryData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={360}>
-              <ScatterChart
-                margin={{ top: 20, right: 40, bottom: 40, left: 40 }}
-              >
-                {/* X and Y axis cross at midpoint */}
-                <XAxis
-                  dataKey="win_prob"
-                  name="Win Probability"
-                  type="number"
-                  domain={[0.4, 1]}
-                  tickFormatter={v => `${(v * 100).toFixed(0)}%`}
-                  label={{
-                    value: "Win Probability (%)",
-                    position: "bottom",
-                    offset: 0,
-                    style: { textAnchor: "middle", fontWeight: 600, fill: "#1e293b" }
-                  }}
-                  axisLine={{ stroke: "#8884d8", strokeWidth: 2 }}
-                />
-                <YAxis
-                  dataKey="popularity"
-                  name="Popularity"
-                  type="number"
-                  domain={[0.4, .5]}
-                  tickFormatter={v => `${(v * 100).toFixed(0)}%`}
-                  label={{
-                    value: "Popularity (%)",
-                    angle: -90,
-                    position: "insideLeft",
-                    style: { textAnchor: "middle", fontWeight: 600, fill: "#1e293b" }
-                  }}
-                  axisLine={{ stroke: "#8884d8", strokeWidth: 2 }}
-                />
-                {/* Reference lines for quadrants */}
-                <ReferenceLine
-                  x={0.7}
-                  stroke="#aaa"
-                  strokeDasharray="3 3"
-                />
-                <ReferenceLine
-                  y={0.3}
-                  stroke="#aaa"
-                  strokeDasharray="3 3"
-                />
-                <ZAxis
-                  dataKey="expected_value"
-                  name="Expected Value"
-                  range={[50, 2000]}
-                  label="Expected Value"
-                />
-                <Tooltip
-                  cursor={{ strokeDasharray: '3 3' }}
-                  formatter={(val, name) =>
-                    name === "Expected Value"
-                      ? val.toFixed(2)
-                      : `${(val * 100).toFixed(1)}%`
-                  }
-                  contentStyle={{ background: "#fff" }}
-                />
-                <Scatter
-                  // name="Teams"
-                  data={summaryData.map(row => ({
-                    ...row,
-                    fill: getFutureValueColor(row.future_value)
-                  }))}
-                  shape="circle"
-                  fillOpacity={0.85}
+            {loading ? (
+              <LoadingSpinner />
+            ) : summaryData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={360}>
+                <ScatterChart
+                  margin={{ top: 20, right: 40, bottom: 40, left: 40 }}
                 >
-                  <LabelList
-                    dataKey="team"
-                    position="top"
-                    style={{ fontSize: 9, fontWeight: 600, fill: "#1e293b" }}
+                  {/* X and Y axis cross at midpoint */}
+                  <XAxis
+                    dataKey="win_prob"
+                    name="Win Probability"
+                    type="number"
+                    domain={[0.4, 1]}
+                    tickFormatter={v => `${(v * 100).toFixed(0)}%`}
+                    label={{
+                      value: "Win Probability (%)",
+                      position: "bottom",
+                      offset: 0,
+                      style: { textAnchor: "middle", fontWeight: 600, fill: "#1e293b" }
+                    }}
+                    axisLine={{ stroke: "#8884d8", strokeWidth: 2 }}
                   />
-                </Scatter>
-              </ScatterChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="text-sm text-blue-500">No data to display. Click "Get Picks" to load.</div>
-          )}
-        </SectionCard>
+                  <YAxis
+                    dataKey="popularity"
+                    name="Popularity"
+                    type="number"
+                    domain={[0.4, .5]}
+                    tickFormatter={v => `${(v * 100).toFixed(0)}%`}
+                    label={{
+                      value: "Popularity (%)",
+                      angle: -90,
+                      position: "insideLeft",
+                      style: { textAnchor: "middle", fontWeight: 600, fill: "#1e293b" }
+                    }}
+                    axisLine={{ stroke: "#8884d8", strokeWidth: 2 }}
+                  />
+                  {/* Reference lines for quadrants */}
+                  <ReferenceLine
+                    x={0.7}
+                    stroke="#aaa"
+                    strokeDasharray="3 3"
+                  />
+                  <ReferenceLine
+                    y={0.3}
+                    stroke="#aaa"
+                    strokeDasharray="3 3"
+                  />
+                  <ZAxis
+                    dataKey="expected_value"
+                    name="Expected Value"
+                    range={[50, 2000]}
+                    label="Expected Value"
+                  />
+                  <Tooltip
+                    cursor={{ strokeDasharray: '3 3' }}
+                    formatter={(val, name) =>
+                      name === "Expected Value"
+                        ? val.toFixed(2)
+                        : `${(val * 100).toFixed(1)}%`
+                    }
+                    contentStyle={{ background: "#fff" }}
+                  />
+                  <Scatter
+                    // name="Teams"
+                    data={summaryData.map(row => ({
+                      ...row,
+                      fill: getFutureValueColor(row.future_value)
+                    }))}
+                    shape="circle"
+                    fillOpacity={0.85}
+                  >
+                    <LabelList
+                      dataKey="team"
+                      position="top"
+                      style={{ fontSize: 9, fontWeight: 600, fill: "#1e293b" }}
+                    />
+                  </Scatter>
+                </ScatterChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="text-sm text-blue-500">No data to display. Click "Get Picks" to load.</div>
+            )}
+          </SectionCard>
+        )}
 
         {/* Simulation Results */}
         {simResults.length > 0 && (
@@ -601,35 +751,79 @@ export default function SurvivorUI() {
           </SectionCard>
         )}
 
-        {/* 
-          TRANSPOSE FUNCTION - Uncomment to use for debugging or analysis
-        */}
-        {/* <SectionCard title="Transpose Picks (Debug)">
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-blue-200 rounded-lg shadow">
-              <thead>
-                <tr>
-                  <th className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase">Entry</th>
-                  {[...Array(entries)].map((_, e) => (
-                    <th key={e} className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase">
-                      Entry {e + 1}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {transposePicks(editPicks).map((entry, entryIdx) => (
-                  <tr key={entryIdx}>
-                    <td className="px-4 py-2 font-semibold text-blue-800">Entry {entryIdx + 1}</td>
-                    {entry.map((team, weekIdx) => (
-                      <td key={weekIdx} className="px-4 py-2">{team || "-"}</td>
+        {/* All Picks by Entry Card */}
+        {showAllPicks && picks.length > 0 && (
+          <SectionCard title="All Weekly Picks by Entry" icon={<BarChart3 className="mr-1 text-blue-600" />}>
+            <div className="w-full overflow-x-auto pb-6">
+              <table className="w-full min-w-max divide-y divide-blue-200 rounded-lg shadow">
+                <thead>
+                  <tr>
+                    <th className="px-4 py-2 text-left text-xs font-bold text-blue-700 uppercase">Week</th>
+                    {[...Array(entries)].map((_, entryIdx) => (
+                      <th key={entryIdx} className="px-4 py-2 text-xs font-bold text-blue-700 uppercase text-center">
+                        Entry {entryIdx + 1}
+                      </th>
                     ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </SectionCard> */}
+                </thead>
+                <tbody>
+                  {[...Array(18)].map((_, weekIdx) => (
+                    <tr key={weekIdx}>
+                      <td className="px-4 py-2 font-semibold text-blue-800">Week {weekIdx + 1}</td>
+                      {[...Array(entries)].map((_, entryIdx) => (
+                        <td key={entryIdx} className="px-4 py-2 text-center">
+                          {picks[entryIdx] && picks[entryIdx][weekIdx]
+                            ? picks[entryIdx][weekIdx]
+                            : <span className="text-gray-400">-</span>}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <button
+              className="mt-4 ml-0 px-4 py-2 bg-red-500 text-white rounded font-bold shadow hover:bg-red-600"
+              onClick={() => setShowClearConfirm(true)}
+            >
+              Clear All Picks
+            </button>
+            {showClearConfirm && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40">
+                <div className="bg-white rounded-lg shadow-lg p-6 max-w-sm w-full text-center">
+                  <div className="mb-4 text-lg font-semibold text-blue-700">Are you sure you want to clear all picks?</div>
+                  <div className="flex justify-center gap-4">
+                    <button
+                      className="px-4 py-2 bg-red-500 text-white rounded font-bold shadow hover:bg-red-600"
+                      onClick={async () => {
+                        const emptyPicks = Array(entries).fill().map(() => Array(18).fill(null));
+                        await fetch("/api/save-picks", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify(emptyPicks),
+                        });
+                        setPicks(emptyPicks);
+                        setEntrySelections(Array(entries).fill(""));
+                        setShowToast(true);
+                        setShowClearConfirm(false);
+                        if (toastTimeout.current) clearTimeout(toastTimeout.current);
+                        toastTimeout.current = setTimeout(() => setShowToast(false), 3000);
+                      }}
+                    >
+                      Yes, Clear All
+                    </button>
+                    <button
+                      className="px-4 py-2 bg-gray-200 text-blue-700 rounded font-bold shadow hover:bg-gray-300"
+                      onClick={() => setShowClearConfirm(false)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </SectionCard>
+        )}
       
       </motion.div>
 
@@ -676,8 +870,8 @@ function getAvailableTeamsForEntryWeek(schedule, picks, weekIdx, entryIdx) {
   // Remove teams already picked by this entry in prior weeks
   const alreadyPicked = new Set();
   for (let w = 0; w < weekIdx; w++) {
-    if (picks[w] && picks[w][entryIdx]) {
-      alreadyPicked.add(picks[w][entryIdx]);
+    if (picks[entryIdx] && picks[entryIdx][w]) {
+      alreadyPicked.add(picks[entryIdx][w]);
     }
   }
 

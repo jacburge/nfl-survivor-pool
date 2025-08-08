@@ -1,15 +1,16 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from nfl_survivor_tool import SURVIVOR_PICKER, compute_team_ratings, load_manual_schedule
-from nfl_survivor_tool import Game
+from nfl_survivor_tool import Game, fetch_betting_lines
 import ast
 import json
+import os
 from schedule_2025 import SCHEDULE_2025
 
 app = Flask(__name__)
 CORS(app)
 
-PICKS_FILE = "picks.json"
+PICKS_PATH = os.path.join(os.path.dirname(__file__), "picks.json")
 
 def serialize_schedule(schedule):
     # Convert datetime.date to string for JSON
@@ -34,18 +35,16 @@ def get_summary():
         raw_schedule = load_manual_schedule()
         games = [Game(**g) for g in raw_schedule if g['week'] <= 18]
         if use_betting:
-            team_ratings = compute_team_ratings(use_betting_lines=True)
+            team_ratings = compute_team_ratings(use_betting_lines=True, week=week)
         else:
             team_ratings = compute_team_ratings()
         
-        # Load current picks
         try:
-            with open(PICKS_FILE, "r") as f:
+            with open(PICKS_PATH, "r") as f:
                 picks = json.load(f)
         except Exception:
             picks = []
 
-        # Ensure correct shape
         while len(picks) < entries:
             picks.append([])
         for entry in picks:
@@ -63,21 +62,27 @@ def get_summary():
             team_ratings=team_ratings,
             used_teams_per_entry=used_teams_per_entry
         )
-        picker.update_situational_factors()
+        if use_betting:
+            betting_lines = fetch_betting_lines(week)
+            if betting_lines:
+                picker.apply_betting_lines(betting_lines)
+            picker.update_situational_factors(skip_win_prob=True)  # <-- pass a flag to skip win prob update
+        else:
+            picker.update_situational_factors()
+
         recommended_picks = picker.recommend_diversified_picks(week)
         summary = picker.summary_for_week(week)
 
-        # Ensure summary is a list of dicts with the correct keys
-        # If not, transform it here
         formatted = []
         for item in summary:
-            team, win_prob, popularity, future_value, expected_value = item
+            team, win_prob, popularity, future_value, expected_value, point_spread = item
             formatted.append({
                 "team": team,
                 "win_prob": win_prob,
                 "popularity": popularity,
                 "future_value": future_value,
                 "expected_value": expected_value,
+                "point_spread": point_spread,
             })
 
         return jsonify({
@@ -130,25 +135,42 @@ def simulate():
 @app.route('/api/picks', methods=['GET'])
 def get_picks():
     try:
-        with open(PICKS_FILE, "r") as f:
+        with open(PICKS_PATH, "r") as f:
             picks = json.load(f)
-    except Exception:
-        picks = []
-    return jsonify({"picks": picks})
-
-@app.route('/api/picks', methods=['POST'])
-def save_picks():
-    try:
-        data = request.json
-        picks = data.get("picks")  # [week][entry]
-        if not picks:
-            return jsonify({"error": "No picks provided"}), 400
-        with open(PICKS_FILE, "w") as f:
-            json.dump(picks, f)
-        return jsonify({"success": True, "picks": picks})
+        return jsonify({"picks": picks}), 200
     except Exception as e:
-        print("Error saving picks:", e)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"picks": []}), 200
+
+@app.route('/api/save-picks', methods=['POST'])
+def save_picks():
+    picks = request.get_json()
+    # Optionally validate picks format here
+    try:
+        with open(PICKS_PATH, "w") as f:
+            json.dump(picks, f, indent=2)
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+def getAvailableTeamsForEntryWeek(schedule, picks, weekIdx, entryIdx):
+    weekNum = weekIdx + 1
+    teams_this_week = set()
+    for game in schedule:
+        if getattr(game, "week", None) == weekNum or (isinstance(game, dict) and game.get("week") == weekNum):
+            home = getattr(game, "home", None) if hasattr(game, "home") else game.get("home")
+            away = getattr(game, "away", None) if hasattr(game, "away") else game.get("away")
+            if home: teams_this_week.add(home)
+            if away: teams_this_week.add(away)
+    already_picked = set()
+    if entryIdx < len(picks):
+        for w in range(weekIdx):
+            if picks[entryIdx] and len(picks[entryIdx]) > w and picks[entryIdx][w]:
+                already_picked.add(picks[entryIdx][w])
+    available = [team for team in teams_this_week if team not in already_picked]
+    # Debug output
+    if not available:
+        print(f"No teams for week {weekNum}, entry {entryIdx}. schedule: {schedule}")
+    return available
 
 if __name__ == '__main__':
     app.run(debug=True, host="0.0.0.0", port=5000)

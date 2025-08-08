@@ -66,7 +66,7 @@ except ImportError:
 # Data definitions
 ###############################################################################
 
-def compute_team_ratings() -> Dict[str, float]:
+def compute_team_ratings(use_betting_lines: bool = False, week: Optional[int] = None) -> Dict[str, float]:
     base = 1500
     scale = 30
     records = {
@@ -115,6 +115,18 @@ def compute_team_ratings() -> Dict[str, float]:
     for team, (wins, losses) in records.items():
         diff = wins - losses
         ratings[team] = base + diff * scale
+
+    if use_betting_lines and week is not None:
+        # Fetch betting lines and update ratings based on implied probabilities
+        betting_lines = fetch_betting_lines(week)
+        # betting_lines structure: {week: { (away, home): spread, ... } }
+        lines = betting_lines.get(week, {})
+        for (away, home), spread in lines.items():
+            # Use spread to adjust ratings: more negative spread = stronger home team
+            # Example: add spread * 10 to home team, subtract from away team
+            ratings[home] += (-spread) * 10
+            ratings[away] -= (-spread) * 10
+
     return ratings
 
 
@@ -330,7 +342,7 @@ class SURVIVOR_PICKER:
     team_ratings: Dict[str, float] = field(default_factory=compute_team_ratings)
     used_teams_per_entry: List[List[str]] = field(default_factory=list)
 
-    def update_situational_factors(self) -> None:
+    def update_situational_factors(self, skip_win_prob=False) -> None:
         """Compute situational advantages and win probabilities for each game.
 
         This method iterates through the schedule and, for each game, calculates
@@ -377,9 +389,10 @@ class SURVIVOR_PICKER:
                 # Altitude advantage: if home field is significantly higher
                 if home_info['alt'] >= 1000 and away_info['alt'] < 1000:
                     elo_diff += ALTITUDE_POINTS
-            # Compute win probabilities
-            game.win_prob_home = elo_probability(elo_diff)
-            game.win_prob_away = 1.0 - game.win_prob_home
+            if not skip_win_prob:
+                # Compute win probabilities
+                game.win_prob_home = elo_probability(elo_diff)
+                game.win_prob_away = 1.0 - game.win_prob_home
             # Update last played date
             if game.date:
                 last_played[game.home] = game.date
@@ -473,57 +486,122 @@ class SURVIVOR_PICKER:
             picks.append(candidates[0][0] if candidates else None)
         return picks
 
-    def recommend_diversified_picks(self, week, fv_weight=0.15, ev_weight=1.0, pop_weight=0.5):
+    def _profile_weights(self, profile: str):
+        """
+        Returns weight presets for different pool profiles.
+        Tweak as desired; these are sane defaults.
+        """
+        presets = {
+            # smaller pool: prioritize raw survival; lighter leverage vs popularity
+            "small":  dict(both_w=1.4, one_w=1.0, ev_w=0.8, fv_w=0.25, herd_w=0.05, min_prob=0.60),
+            # medium/default pool: balanced leverage and future-value conservation
+            "medium": dict(both_w=1.6, one_w=1.0, ev_w=0.8, fv_w=0.25, herd_w=0.15, min_prob=0.60),
+            # large pool: more leverage vs public, still care about both-entry survival
+            "large":  dict(both_w=1.7, one_w=1.0, ev_w=0.75, fv_w=0.30, herd_w=0.30, min_prob=0.58),
+            # mega pool (thousands+): lean hardest into leverage & portfolio thinking
+            "mega":   dict(both_w=1.8, one_w=1.0, ev_w=0.70, fv_w=0.30, herd_w=0.40, min_prob=0.56),
+        }
+        return presets.get(profile, presets["medium"])
+
+
+    def recommend_diversified_picks(
+        self,
+        week: int,
+        profile: str = "medium",
+        override_weights: dict = None,
+    ) -> List[Optional[str]]:
+        """
+        Recommend one team per entry for this week, maximizing portfolio survival.
+        - Uses EV once: EV_week = win_prob * (1 - popularity)
+        - Penalizes burning high future-value (FV) with a decay as weeks run out
+        - Adds small 'herd' co-risk penalty when BOTH picks are very popular
+        - Avoids duplicate teams across entries
+
+        Returns list of picks aligned to self.used_teams_per_entry order.
+        """
+        w = self._profile_weights(profile)
+        if override_weights:
+            w.update(override_weights)
+
         week_games = [g for g in self.schedule if g.week == week]
+        if not week_games:
+            return [None] * len(self.used_teams_per_entry)
 
-        available_teams_per_entry = []
-        team_info_per_entry = []
+        # dynamic FV penalty decay (early weeks: strong, late: fades)
+        weeks_left = max(1, 18 - week + 1)
+        fv_decay = weeks_left / 18.0  # 1.0 at week 1, -> ~0 by week 18
 
-        for used_teams in self.used_teams_per_entry:
-            options = []
-            info = []
+        # Build candidate lists per entry
+        available_teams_per_entry: List[List[str]] = []
+        info_per_entry: List[List[dict]] = []
+
+        for used in self.used_teams_per_entry:
+            teams, infos = [], []
             for g in week_games:
-                for team, prob in [(g.home, g.win_prob_home), (g.away, g.win_prob_away)]:
-                    if team not in used_teams and team not in options:
-                        fv = self.future_value(team, week)
-                        pop = g.popularity or 0.1
-                        ev = prob * (1 - pop) - fv * fv_weight
-                        options.append(team)
-                        info.append({
-                            "team": team,
-                            "prob": prob,
-                            "future_value": fv,
-                            "popularity": pop,
-                            "expected_value": ev
-                        })
-            available_teams_per_entry.append(options)
-            team_info_per_entry.append(info)
+                if g.win_prob_home is None or g.win_prob_away is None:
+                    continue
 
-        best_combo = None
-        best_score = -float("inf")
+                for team, prob, pop in [
+                    (g.home, g.win_prob_home, (g.popularity or 0.10)),
+                    (g.away, g.win_prob_away, (g.popularity or 0.10)),  # reuse pop proxy if away fav
+                ]:
+                    if team in used or team in teams:
+                        continue
+                    if prob <= w["min_prob"]:
+                        continue
+
+                    fv = self.future_value(team, week)  # your FV function
+                    ev = prob * (1.0 - pop)             # weekly EV (win prob + leverage)
+
+                    teams.append(team)
+                    infos.append({
+                        "team": team,
+                        "prob": float(prob),
+                        "pop": float(pop),
+                        "fv": float(fv),
+                        "ev": float(ev),
+                    })
+
+            available_teams_per_entry.append(teams)
+            info_per_entry.append(infos)
+
+        # If any entry has no options, bail gracefully
+        if any(len(opts) == 0 for opts in available_teams_per_entry):
+            return [None if len(opts) == 0 else opts[0] for opts in available_teams_per_entry]
+
+        best_combo: Optional[Tuple[str, ...]] = None
+        best_score = -1e9
 
         for picks in itertools.product(*available_teams_per_entry):
+            # no duplicate teams across entries
             if len(set(picks)) < len(picks):
-                continue  # Avoid duplicate picks across entries
+                continue
 
-            probs, fvs, evs, pops = [], [], [], []
+            probs, pops, fvs, evs = [], [], [], []
             for i, team in enumerate(picks):
                 idx = available_teams_per_entry[i].index(team)
-                info = team_info_per_entry[i][idx]
+                info = info_per_entry[i][idx]
                 probs.append(info["prob"])
-                fvs.append(info["future_value"])
-                evs.append(info["expected_value"])
-                pops.append(info["popularity"])
+                pops.append(info["pop"])
+                fvs.append(info["fv"])
+                evs.append(info["ev"])
 
-            # Key survival objective: at least one survives
-            survival_prob = 1 - math.prod([1 - p for p in probs])
+            # portfolio survival
+            both_survive   = math.prod(probs)
+            at_least_one   = 1.0 - math.prod((1.0 - p) for p in probs)
 
-            # Composite score
+            # future-value penalty with decay (shadow price)
+            fv_penalty = fv_decay * sum(fvs)
+
+            # small popularity co-risk penalty (avoid both on herd teams)
+            herd_copenalty = (pops[0] * pops[1]) if len(pops) >= 2 else 0.0
+
             score = (
-                survival_prob +
-                ev_weight * sum(evs) +
-                pop_weight * sum(1 - p for p in pops) -  # Lower popularity is better
-                fv_weight * sum(fvs)                     # Penalize burning high-future-value teams
+                w["both_w"] * both_survive
+                + w["one_w"] * at_least_one
+                + w["ev_w"] * sum(evs)
+                - w["fv_w"] * fv_penalty
+                - w["herd_w"] * herd_copenalty
             )
 
             if score > best_score:
@@ -532,12 +610,11 @@ class SURVIVOR_PICKER:
 
         return list(best_combo) if best_combo else [None] * len(self.used_teams_per_entry)
 
-    def summary_for_week(self, week: int) -> List[Tuple[str, float, float, float, float]]:
-        """Return a summary of win probability, popularity and EV for the week's games.
+    def summary_for_week(self, week: int) -> List[Tuple[str, float, float, float, float, Optional[float]]]:
+        """Return a summary of win probability, popularity, EV, and point spread for the week's games.
 
-        Returns a list of tuples: (fav_team, win_prob, popularity, future_value)
-        sorted by EV descending.  This can help interpret the model's
-        recommendations.
+        Returns a list of tuples: (fav_team, win_prob, popularity, future_value, expected_value, point_spread)
+        sorted by EV descending. This can help interpret the model's recommendations.
         """
         week_games = [g for g in self.schedule if g.week == week]
         self.compute_pick_popularity(week_games)
@@ -550,13 +627,15 @@ class SURVIVOR_PICKER:
                 team = g.home
                 prob = g.win_prob_home
                 pop = g.popularity or 0.1
+                point_spread = getattr(g, "point_spread", None) if hasattr(g, "point_spread") else None
             else:
                 team = g.away
                 prob = g.win_prob_away
                 pop = g.popularity or 0.1
+                point_spread = getattr(g, "point_spread", None) if hasattr(g, "point_spread") else None
             fv = self.future_value(team, week)
             ev = prob * (1 - pop) - fv * 0.05
-            summary.append((team, prob, pop, fv, ev))
+            summary.append((team, prob, pop, fv, ev, point_spread))
         summary.sort(key=lambda t: t[4], reverse=True)
         return summary
 
@@ -782,31 +861,43 @@ class SURVIVOR_PICKER:
 
     def apply_betting_lines(self, lines: Dict[int, Dict[Tuple[str, str], float]]) -> None:
         """
-        Incorporate point spreads into the win probability model.
-
-        ``lines`` should be a dictionary keyed by week number.  Each value is
-        another dict mapping (away_team, home_team) tuples to the home team’s
-        point spread (negative values indicate the home team is favoured).
-        For example::
-
-            lines[1][('Dallas Cowboys', 'Philadelphia Eagles')] = -3.5
-
-        The spread is converted to an implied win probability using a
-        logistic model: P(win) = 1/(1+exp(-k*spread)).  A typical value for
-        k is 0.15 (so a 7‑point favourite has ~70% win probability).  This
-        update modifies ``win_prob_home`` and ``win_prob_away`` for the
-        corresponding games.
+        Apply point spreads to estimate win probabilities.
+        
+        Vegas convention:
+        - Negative spread => home team is favored
+        - Positive spread => home team is underdog
+        
+        Uses logistic model: P(win) = 1 / (1 + exp(-k * spread_diff))
+        Clamps probabilities between 1% and 99%.
         """
-        k = 0.15
+        k = 0.15  # sensitivity factor
+        clamp_min, clamp_max = 0.01, 0.99
+
         for game in self.schedule:
-            if game.week in lines:
-                key = (game.away, game.home)
-                if key in lines[game.week]:
-                    spread = lines[game.week][key]
-                    # Negative spread: home favoured; positive: home underdog
-                    prob_home = 1.0 / (1.0 + math.exp(-k * (-spread)))
-                    game.win_prob_home = prob_home
-                    game.win_prob_away = 1.0 - prob_home
+            if game.week not in lines:
+                continue
+
+            key = (game.away, game.home)
+            if key not in lines[game.week]:
+                continue
+
+            spread = lines[game.week][key]  # negative = home favored
+
+            # Convert spread to home team "advantage" in model terms
+            # Negative spread means home favored => invert sign for logistic
+            home_advantage = -spread  
+
+            # Calculate win probability for home team
+            prob_home = 1 / (1 + math.exp(-k * home_advantage))
+
+            # Clamp probabilities to avoid 0% or 100%
+            prob_home = max(clamp_min, min(clamp_max, prob_home))
+            prob_away = 1 - prob_home
+
+            game.win_prob_home = prob_home
+            game.win_prob_away = prob_away
+            game.point_spread = spread
+            print(f"Week {game.week} | {game.away} @ {game.home} | Spread {spread} | Home win% {prob_home:.2%}")
 
     def apply_injury_reports(self, injuries: Dict[str, float]) -> None:
         """
