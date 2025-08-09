@@ -19,6 +19,8 @@ import {
 } from "recharts";
 import picksData from "../../backend/picks.json"; // Adjust path if needed
 
+const API_BASE = 'https://nfl-survivor-pool.onrender.com';
+
 function LoadingSpinner() {
   return (
     <div className="flex justify-center items-center py-8">
@@ -147,7 +149,7 @@ export default function SurvivorUI() {
 
   // Fetch picks on mount and when week/entries change
   useEffect(() => {
-    fetch("/api/picks")
+    fetch(`${API_BASE}/api/picks`)
       .then(res => res.json())
       .then(data => setPicks(data.picks || []));
   }, [week, entries]);
@@ -173,7 +175,7 @@ export default function SurvivorUI() {
     setLoading(true);
     try {
       const res = await fetch(
-        `/api/summary?week=${week}&entries=${entries}&betting=${useBetting}&fv_weight=${fvWeight}&ev_weight=${evWeight}&pop_weight=${popWeight}`
+        `${API_BASE}/api/summary?week=${week}&entries=${entries}&betting=${useBetting}&fv_weight=${fvWeight}&ev_weight=${evWeight}&pop_weight=${popWeight}`
       );
       const data = await res.json();
       const sorted = [...data.summary].sort((a, b) => b.expected_value - a.expected_value);
@@ -214,7 +216,7 @@ export default function SurvivorUI() {
   // Save picks.json (requires backend API endpoint to write file)
   async function handleSavePicks() {
     setSaveLoading(true);
-    await fetch("/api/save-picks", {
+    await fetch(`${API_BASE}/api/save-picks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(editPicks),
@@ -285,7 +287,7 @@ export default function SurvivorUI() {
     // Load existing picks.json from backend
     let picks = [];
     try {
-      const res = await fetch("/api/picks");
+      const res = await fetch(`${API_BASE}/api/picks`);
       const data = await res.json();
       picks = data.picks || [];
     } catch {
@@ -310,7 +312,7 @@ export default function SurvivorUI() {
       });
     }
     // Save to backend
-    await fetch("/api/save-picks", {
+    await fetch(`${API_BASE}/api/save-picks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(picks),
@@ -797,7 +799,7 @@ export default function SurvivorUI() {
                       className="px-4 py-2 bg-red-500 text-white rounded font-bold shadow hover:bg-red-600"
                       onClick={async () => {
                         const emptyPicks = Array(entries).fill().map(() => Array(18).fill(null));
-                        await fetch("/api/save-picks", {
+                        await fetch(`${API_BASE}/api/save-picks`, {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
                           body: JSON.stringify(emptyPicks),
