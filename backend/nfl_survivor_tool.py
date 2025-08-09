@@ -1077,8 +1077,10 @@ def main():
         betting_lines = fetch_betting_lines(args.week)
         if betting_lines:
             picker.apply_betting_lines(betting_lines)
-
-    picker.update_situational_factors()
+            picker.update_situational_factors(skip_win_prob=True)
+    else:
+        picker.update_situational_factors()
+    
     picks = picker.recommend_picks(args.week)
     for idx, pick in enumerate(picks):
         print(f"Recommended pick for Entry {idx+1} (week {args.week}): {pick}")
