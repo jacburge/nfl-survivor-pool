@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
-import { BarChart3, Trophy, Star } from "lucide-react";
+import { BarChart3, Trophy, Star, Eye, EyeOff } from "lucide-react";
 import {
   ResponsiveContainer,
   ScatterChart,
@@ -20,6 +20,7 @@ import {
 import picksData from "../../backend/picks.json"; // Adjust path if needed
 
 const API_BASE = 'https://nfl-survivor-pool.onrender.com';
+const PASSWORD = import.meta.env.VITE_PASSWORD; // Change this to your desired password
 
 function LoadingSpinner() {
   return (
@@ -111,6 +112,8 @@ function getTeamsForWeek(schedule, weekIdx) {
 }
 
 export default function SurvivorUI() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [inputPassword, setInputPassword] = useState("");
   const [week, setWeek] = useState(1);
   const [entries, setEntries] = useState(2);
   const [summaryData, setSummaryData] = useState([]);
@@ -138,6 +141,7 @@ export default function SurvivorUI() {
   const [popWeight, setPopWeight] = useState(1);
   const [showSummary, setShowSummary] = useState(false);
   const [showAllPicks, setShowAllPicks] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   // Track selected picks per entry for the current week
   const [entrySelections, setEntrySelections] = useState(Array(entries).fill(""));
@@ -342,6 +346,58 @@ export default function SurvivorUI() {
     if (aVal > bVal) return sortDirection === "asc" ? 1 : -1;
     return 0;
   });
+
+  if (!authenticated) {
+    return (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center"
+        style={{
+          background: "linear-gradient(120deg, rgba(30,41,59,0.92) 0%, rgba(59,130,246,0.85) 100%)",
+          backdropFilter: "blur(8px)",
+        }}
+      >
+        <div className="bg-gradient-to-br from-blue-50 via-white to-red-50 rounded-2xl shadow-2xl p-8 border border-blue-200 flex flex-col items-center min-w-[340px] max-w-xs">
+          <h1 className="text-2xl md:text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-blue-700 via-blue-400 to-red-500 mb-2 text-center drop-shadow">
+            Welcome to NFL Survivor Pool Picker
+          </h1>
+          <h2 className="text-base font-semibold text-blue-700 mb-6 text-center">Enter password</h2>
+          <input
+            type={showPassword ? "text" : "password"}
+            value={inputPassword}
+            onChange={e => setInputPassword(e.target.value)}
+            className="border border-blue-300 rounded-lg px-4 py-2 mb-4 w-full text-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition pr-10"
+            placeholder="Password"
+            autoFocus
+            onKeyDown={e => {
+              if (e.key === "Enter" && inputPassword === PASSWORD) {
+                setAuthenticated(true);
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="absolute right-8 top-[110px] text-blue-500 hover:text-blue-700"
+            style={{ marginTop: "-52px" }}
+            onClick={() => setShowPassword(v => !v)}
+            tabIndex={-1}
+          >
+            {showPassword ? <EyeOff size={22} /> : <Eye size={22} />}
+          </button>
+          <button
+            className="w-full bg-gradient-to-r from-blue-600 to-red-500 text-white px-4 py-2 rounded-lg font-bold shadow hover:from-blue-700 hover:to-red-600 transition"
+            onClick={() => {
+              if (inputPassword === PASSWORD) setAuthenticated(true);
+            }}
+          >
+            Unlock
+          </button>
+          {inputPassword && inputPassword !== PASSWORD && (
+            <div className="text-red-500 mt-3 text-sm font-medium">Incorrect password</div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <>
